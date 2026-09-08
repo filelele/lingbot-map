@@ -94,6 +94,7 @@ class PointCloudViewer:
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
         skyseg_model_path: str = "skyseg.onnx",
+        default_pcd_path: Optional[str] = None,
     ):
         self.model = model
         self.size = size
@@ -104,6 +105,8 @@ class PointCloudViewer:
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
         self.point_size = point_size
+        self.downsample_factor = downsample_factor
+        self.default_pcd_path = default_pcd_path or "point_cloud.pcd"
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
 
         # Process the prediction dictionary to create pc_list, color_list, conf_list
@@ -515,6 +518,31 @@ class PointCloudViewer:
         def _(_) -> None:
             self._export_glb()
 
+        # PCD export controls
+        with self.server.gui.add_folder("Export PCD"):
+            default_pcd = getattr(self, "default_pcd_path", "point_cloud.pcd")
+            self.pcd_output_path = self.server.gui.add_text(
+                "Output Path", initial_value=default_pcd
+            )
+            self.pcd_downsample_slider = self.server.gui.add_slider(
+                "Downsample Factor", min=1, max=100, step=1,
+                initial_value=int(getattr(self, "downsample_factor", 10)),
+                hint="1 = all valid points, >1 = subsample points for smaller PCD file."
+            )
+            self.pcd_binary_checkbox = self.server.gui.add_checkbox(
+                "Binary Format", initial_value=True,
+                hint="Binary PCD is much smaller and faster to load than ASCII."
+            )
+            self.pcd_export_button = self.server.gui.add_button(
+                "Export PCD",
+                hint="Export point cloud (no cameras) as .pcd file.",
+            )
+            self.pcd_status = self.server.gui.add_text("Status", initial_value="Ready")
+
+        @self.pcd_export_button.on_click
+        def _(_) -> None:
+            self._export_pcd()
+
         # Video saving controls
         with self.server.gui.add_folder("Video Saving"):
             self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
@@ -798,6 +826,84 @@ class PointCloudViewer:
         mode_str = f"spheres r={self.glb_sphere_radius_slider.value}" if export_mode == "Spheres" else "points"
         self.glb_status.value = f"Saved: {output_path} ({n_pts:,} {mode_str})"
         print(f"GLB exported to {output_path} ({n_pts:,} {mode_str})")
+
+    def export_pcd(
+        self,
+        output_path: str,
+        downsample_factor: Optional[int] = None,
+        vis_threshold: Optional[float] = None,
+        binary: bool = True,
+    ) -> Optional[str]:
+        """Export current filtered point cloud (only points, cameras excluded) to a .pcd file.
+
+        Args:
+            output_path: Path where the .pcd file will be saved.
+            downsample_factor: Downsample factor (1 = keep all points). If None, uses GUI slider value.
+            vis_threshold: Confidence threshold for points. If None, uses current viewer threshold.
+            binary: Whether to write binary PCD (recommended) or ASCII PCD.
+
+        Returns:
+            The saved path if successful, None if no points survived filtering.
+        """
+        from lingbot_map.vis.pcd_export import write_pcd
+
+        if downsample_factor is None:
+            downsample_factor = int(self.pcd_downsample_slider.value) if hasattr(self, "pcd_downsample_slider") else (
+                int(self.downsample_slider.value) if hasattr(self, "downsample_slider") else 1
+            )
+
+        orig_vis = self.vis_threshold
+        if vis_threshold is not None:
+            self.vis_threshold = vis_threshold
+
+        all_points = []
+        all_colors = []
+        try:
+            for step in self.all_steps:
+                pc = self.pcs[step]["pc"]
+                color = self.pcs[step]["color"]
+                conf = self.pcs[step]["conf"]
+                edge_color = self.pcs[step].get("edge_color", None)
+
+                pts, cols = self.parse_pc_data(
+                    pc, color, conf, edge_color, set_border_color=False,
+                    downsample_factor=downsample_factor,
+                )
+                if len(pts) > 0:
+                    all_points.append(pts)
+                    if cols.dtype != np.uint8:
+                        cols = (np.clip(cols, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    all_colors.append(cols)
+        finally:
+            self.vis_threshold = orig_vis
+
+        if not all_points:
+            print("Warning: No points survived filtering for PCD export.")
+            return None
+
+        vertices = np.concatenate(all_points, axis=0)
+        colors_u8 = np.concatenate(all_colors, axis=0)
+
+        write_pcd(output_path, vertices, colors_u8, binary=binary)
+        print(f"PCD exported to {output_path} ({len(vertices):,} points, binary={binary})")
+        return output_path
+
+    def _export_pcd(self):
+        """GUI callback for exporting PCD."""
+        out_path = self.pcd_output_path.value
+        self.pcd_status.value = "Exporting PCD..."
+        try:
+            res = self.export_pcd(
+                output_path=out_path,
+                downsample_factor=int(self.pcd_downsample_slider.value),
+                binary=self.pcd_binary_checkbox.value,
+            )
+            if res:
+                self.pcd_status.value = f"Saved: {out_path}"
+            else:
+                self.pcd_status.value = "Error: no points"
+        except Exception as e:
+            self.pcd_status.value = f"Error: {e}"
 
     @staticmethod
     def _build_trajectory_tube(positions, radius, colormap, num_cameras):

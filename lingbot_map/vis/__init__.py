@@ -38,6 +38,7 @@ from lingbot_map.vis.sky_segmentation import (
     segment_sky,
 )
 from lingbot_map.vis.glb_export import predictions_to_glb
+from lingbot_map.vis.pcd_export import write_pcd, export_predictions_to_pcd
 
 __all__ = [
     # Main viewer
@@ -46,6 +47,9 @@ __all__ = [
     "viser_wrapper",
     # GLB export
     "predictions_to_glb",
+    # PCD export
+    "write_pcd",
+    "export_predictions_to_pcd",
     # Utilities
     "CameraState",
     "colorize",

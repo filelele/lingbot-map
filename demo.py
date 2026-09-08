@@ -419,6 +419,30 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument(
+        "--export_pcd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export point cloud as .pcd file in the frames folder (cameras excluded). Default: True.",
+    )
+    parser.add_argument(
+        "--pcd_filename",
+        type=str,
+        default="point_cloud.pcd",
+        help="Filename for exported .pcd file in frames folder (or custom path). Default: point_cloud.pcd",
+    )
+    parser.add_argument(
+        "--pcd_downsample_factor",
+        type=int,
+        default=None,
+        help="Downsample factor for exported .pcd file. If unset, uses --downsample_factor.",
+    )
+    parser.add_argument(
+        "--pcd_binary",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save .pcd file in binary format (compact & fast) vs ASCII. Default: True.",
+    )
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
@@ -586,11 +610,25 @@ def main():
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
 
-    # ── Visualize ────────────────────────────────────────────────────────────
+
+    # ── PCD Export & Visualization ───────────────────────────────────────────
+    if os.path.isabs(args.pcd_filename) or os.path.dirname(args.pcd_filename):
+        pcd_output_path = args.pcd_filename
+    else:
+        pcd_output_path = os.path.join(resolved_image_folder, args.pcd_filename)
+
+    pcd_downsample = (
+        args.pcd_downsample_factor
+        if args.pcd_downsample_factor is not None
+        else args.downsample_factor
+    )
+
+    pred_vis_dict = prepare_for_visualization(predictions, images_cpu)
+
     try:
         from lingbot_map.vis import PointCloudViewer
         viewer = PointCloudViewer(
-            pred_dict=prepare_for_visualization(predictions, images_cpu),
+            pred_dict=pred_vis_dict,
             port=args.port,
             vis_threshold=args.conf_threshold,
             downsample_factor=args.downsample_factor,
@@ -600,11 +638,37 @@ def main():
             skyseg_model_path=args.sky_model,
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            default_pcd_path=pcd_output_path,
         )
+
+        # Automatically export PCD file in the frames folder
+        if args.export_pcd:
+            print(f"\n[PCD Export] Saving point cloud to {pcd_output_path} (downsample={pcd_downsample}, conf_thresh={args.conf_threshold})...")
+            viewer.export_pcd(
+                output_path=pcd_output_path,
+                downsample_factor=pcd_downsample,
+                vis_threshold=args.conf_threshold,
+                binary=args.pcd_binary,
+            )
+
         viewer.run()
     except ImportError:
         print("viser not installed. Install with: pip install lingbot-map[vis]")
         print(f"Predictions contain keys: {list(predictions.keys())}")
+        if args.export_pcd:
+            from lingbot_map.vis.pcd_export import export_predictions_to_pcd
+            print(f"\n[PCD Export] Saving point cloud to {pcd_output_path} (downsample={pcd_downsample}, conf_thresh={args.conf_threshold})...")
+            export_predictions_to_pcd(
+                pred_dict=pred_vis_dict,
+                output_path=pcd_output_path,
+                vis_threshold=args.conf_threshold,
+                downsample_factor=pcd_downsample,
+                mask_sky=args.mask_sky,
+                image_folder=resolved_image_folder,
+                sky_mask_dir=args.sky_mask_dir,
+                sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+                binary=args.pcd_binary,
+            )
 
 
 if __name__ == "__main__":

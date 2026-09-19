@@ -39,6 +39,7 @@ from lingbot_map.vis.sky_segmentation import (
 )
 from lingbot_map.vis.glb_export import predictions_to_glb
 from lingbot_map.vis.pcd_export import write_pcd, export_predictions_to_pcd
+from lingbot_map.vis.occupancy_grid import generate_occupancy_grid, export_occupancy_grid
 
 __all__ = [
     # Main viewer
@@ -50,6 +51,9 @@ __all__ = [
     # PCD export
     "write_pcd",
     "export_predictions_to_pcd",
+    # Occupancy grid export
+    "generate_occupancy_grid",
+    "export_occupancy_grid",
     # Utilities
     "CameraState",
     "colorize",

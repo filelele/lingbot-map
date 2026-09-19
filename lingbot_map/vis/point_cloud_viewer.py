@@ -100,7 +100,7 @@ class PointCloudViewer:
         self.size = size
         self.state_args = state_args
         self.server = viser.ViserServer(host="0.0.0.0", port=port)
-        self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
+        self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible", control_width="large")
         self.device = device
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
@@ -543,6 +543,81 @@ class PointCloudViewer:
         def _(_) -> None:
             self._export_pcd()
 
+        # Occupancy Grid Export controls
+        with self.server.gui.add_folder("Export 2D Occupancy Grid"):
+            default_pcd = getattr(self, "default_pcd_path", "point_cloud.pcd")
+            pcd_dir = os.path.dirname(default_pcd)
+            if pcd_dir:
+                default_occ_path = os.path.join(pcd_dir, "occupancy_grid", "occupancy_grid.png")
+            else:
+                default_occ_path = os.path.join("occupancy_grid", "occupancy_grid.png")
+
+            self.occ_output_path = self.server.gui.add_text(
+                "Output Path", initial_value=default_occ_path,
+                hint="Saves in occupancy_grid folder (.png and .yaml)."
+            )
+            self.occ_bounds_info = self.server.gui.add_markdown(
+                "Initializing scene bounds..."
+            )
+            self.occ_hist_image = self.server.gui.add_image(
+                np.zeros((180, 340, 3), dtype=np.uint8),
+                label="Y-Height Histogram"
+            )
+            self.occ_res_input = self.server.gui.add_number(
+                "Resolution", initial_value=0.05, min=0.001, max=10.0, step=0.01,
+                hint="Units per cell. Constrained to 5x5 - 2000x2000 cells."
+            )
+            self.occ_y_min_input = self.server.gui.add_number(
+                "Y Min", initial_value=-1.0, step=0.05,
+                hint="Upper obstacle boundary (more negative Y = higher up)."
+            )
+            self.occ_y_max_input = self.server.gui.add_number(
+                "Y Max", initial_value=0.5, step=0.05,
+                hint="Lower obstacle boundary (more positive Y = closer to floor; cut off before floor peak)."
+            )
+            self.occ_min_points_slider = self.server.gui.add_slider(
+                "Min Points / Cell", min=1, max=20, step=1, initial_value=3,
+                hint="Minimum 3D points in a cell to mark it occupied (filters floating noise)."
+            )
+            self.occ_fill_void_checkbox = self.server.gui.add_checkbox(
+                "Fill Void as Occupied", initial_value=True,
+                hint="Fill unmapped void outside walls as occupied using flood fill."
+            )
+            self.occ_btn_refresh = self.server.gui.add_button(
+                "Refresh Histogram & Bounds",
+                hint="Recalculate bounds and histogram."
+            )
+            self.occ_export_button = self.server.gui.add_button(
+                "Export Occupancy Grid",
+                hint="Generate and export .png and .yaml."
+            )
+            self.occ_status = self.server.gui.add_text("Status", initial_value="Ready")
+            self.occ_preview_image = self.server.gui.add_image(
+                np.zeros((100, 100, 3), dtype=np.uint8),
+                label="Map Preview"
+            )
+
+        @self.occ_btn_refresh.on_click
+        def _(_) -> None:
+            self._refresh_occupancy_grid_data(reset_inputs=False)
+
+        @self.occ_res_input.on_update
+        def _(_) -> None:
+            self._update_occupancy_grid_bounds_display()
+
+        @self.occ_y_min_input.on_update
+        def _(_) -> None:
+            self._update_occupancy_grid_histogram_display()
+
+        @self.occ_y_max_input.on_update
+        def _(_) -> None:
+            self._update_occupancy_grid_histogram_display()
+
+        @self.occ_export_button.on_click
+        def _(_) -> None:
+            self._export_occupancy_grid()
+
+
         # Video saving controls
         with self.server.gui.add_folder("Video Saving"):
             self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
@@ -603,6 +678,9 @@ class PointCloudViewer:
         @self.camera_downsample_slider.on_update
         def _(_) -> None:
             self._regenerate_cameras()
+
+        # Initialize occupancy grid bounds and histogram once scene points are loaded
+        self._init_occupancy_grid_state()
 
     def _regenerate_point_clouds(self):
         """Regenerate all point clouds with current settings."""
@@ -904,6 +982,214 @@ class PointCloudViewer:
                 self.pcd_status.value = "Error: no points"
         except Exception as e:
             self.pcd_status.value = f"Error: {e}"
+
+    def _get_all_scene_points(
+        self, downsample_factor: int = 1, vis_threshold: Optional[float] = None
+    ) -> np.ndarray:
+        """Gather all valid points across all frames with current or specified filtering."""
+        orig_vis = self.vis_threshold
+        if vis_threshold is not None:
+            self.vis_threshold = vis_threshold
+
+        all_points = []
+        try:
+            for step in self.all_steps:
+                pc = self.pcs[step]["pc"]
+                color = self.pcs[step]["color"]
+                conf = self.pcs[step]["conf"]
+                edge_color = self.pcs[step].get("edge_color", None)
+
+                pts, _ = self.parse_pc_data(
+                    pc, color, conf, edge_color, set_border_color=False,
+                    downsample_factor=downsample_factor,
+                )
+                if len(pts) > 0:
+                    all_points.append(pts)
+        finally:
+            self.vis_threshold = orig_vis
+
+        if not all_points:
+            return np.empty((0, 3), dtype=np.float32)
+        return np.concatenate(all_points, axis=0)
+
+    def _init_occupancy_grid_state(self):
+        """Initialize bounds, histogram, and default controls for occupancy grid."""
+        try:
+            self._refresh_occupancy_grid_data(reset_inputs=True)
+        except Exception as e:
+            print(f"[OccupancyGrid] Initialization error: {e}")
+
+    def _refresh_occupancy_grid_data(self, reset_inputs: bool = False):
+        """Calculate scene bounds and Y histogram from current scene points."""
+        from lingbot_map.vis.occupancy_grid import (
+            compute_scene_bounds,
+            compute_y_histogram,
+            validate_grid_config,
+        )
+
+        pts = self._get_all_scene_points(downsample_factor=1)
+        if len(pts) == 0:
+            if hasattr(self, "occ_bounds_info"):
+                self.occ_bounds_info.content = "⚠️ **Warning:** No valid points available in scene."
+            return
+
+        self._occ_bounds = compute_scene_bounds(pts)
+        self._occ_hist_counts, self._occ_hist_edges, defaults = compute_y_histogram(pts, bins=100)
+        self._occ_floor_peak = defaults["floor_y_peak"]
+
+        if reset_inputs:
+            x_span = self._occ_bounds["x_span"]
+            z_span = self._occ_bounds["z_span"]
+            smaller_span = min(x_span, z_span)
+            default_res = round(max(0.01, smaller_span / 50.0), 3)
+
+            # Ensure default resolution produces grid within 5x5 to 2000x2000
+            valid, _, cols, rows = validate_grid_config(
+                self._occ_bounds["x_min"], self._occ_bounds["x_max"],
+                self._occ_bounds["z_min"], self._occ_bounds["z_max"],
+                default_res,
+            )
+            if not valid:
+                if cols < 5 or rows < 5:
+                    default_res = round(max(x_span, z_span) / 5.0, 3)
+                elif cols > 2000 or rows > 2000:
+                    default_res = round(max(x_span, z_span) / 1000.0, 3)
+
+            self.occ_res_input.value = default_res
+            self.occ_y_min_input.value = round(defaults["default_y_min"], 2)
+            self.occ_y_max_input.value = round(defaults["default_y_max"], 2)
+
+        self._update_occupancy_grid_histogram_display()
+        self._update_occupancy_grid_bounds_display()
+
+    def _update_occupancy_grid_histogram_display(self):
+        """Re-render histogram image with current y_min and y_max markers."""
+        if not hasattr(self, "_occ_hist_counts") or self._occ_hist_counts is None:
+            return
+
+        from lingbot_map.vis.occupancy_grid import plot_y_histogram_image
+        y_min = float(self.occ_y_min_input.value)
+        y_max = float(self.occ_y_max_input.value)
+
+        hist_img = plot_y_histogram_image(
+            counts=self._occ_hist_counts,
+            bin_edges=self._occ_hist_edges,
+            y_min=y_min,
+            y_max=y_max,
+        )
+        self.occ_hist_image.image = hist_img
+        self._update_occupancy_grid_bounds_display()
+
+    def _update_occupancy_grid_bounds_display(self):
+        """Update markdown bounds info and validate resolution."""
+        if not hasattr(self, "_occ_bounds") or self._occ_bounds is None:
+            return
+
+        from lingbot_map.vis.occupancy_grid import validate_grid_config
+        b = self._occ_bounds
+        res = float(self.occ_res_input.value)
+        y_min = float(self.occ_y_min_input.value)
+        y_max = float(self.occ_y_max_input.value)
+
+        valid, msg, cols, rows = validate_grid_config(
+            b["x_min"], b["x_max"], b["z_min"], b["z_max"], res
+        )
+
+        status_badge = "✅" if valid else "❌"
+        y_warning = ""
+        if y_min >= y_max:
+            y_warning = "\n> ⚠️ **Warning:** Y Min must be less than Y Max (Y Min is higher up physically)."
+
+        floor_peak_str = f"+{self._occ_floor_peak:.2f}" if hasattr(self, "_occ_floor_peak") else "N/A"
+
+        self.occ_bounds_info.content = (
+            f"**Scene Bounds:**\n"
+            f"* **X:** `[{b['x_min']:.2f}, {b['x_max']:.2f}]` (span: `{b['x_span']:.2f}`)\n"
+            f"* **Z:** `[{b['z_min']:.2f}, {b['z_max']:.2f}]` (span: `{b['z_span']:.2f}`)\n"
+            f"* **Y:** `[{b['y_min']:.2f}, {b['y_max']:.2f}]` (floor peak: `{floor_peak_str}`)\n"
+            f"* **Grid:** **`{cols} x {rows}`** cells (`{res:.3g}` unit/cell)\n"
+            f"* **Status:** {status_badge} {msg}{y_warning}"
+        )
+
+    def export_occupancy_grid(
+        self,
+        output_path: str,
+        resolution: Optional[float] = None,
+        y_min: Optional[float] = None,
+        y_max: Optional[float] = None,
+        min_points_per_cell: Optional[int] = None,
+        fill_unexplored_as_occupied: Optional[bool] = None,
+        downsample_factor: int = 1,
+    ) -> Tuple[str, str, Dict[str, Any], np.ndarray]:
+        """Generate and export a 2D occupancy grid map (.png and .yaml)."""
+        from lingbot_map.vis.occupancy_grid import export_occupancy_grid, validate_grid_config
+
+        if resolution is None:
+            resolution = float(self.occ_res_input.value)
+        if y_min is None:
+            y_min = float(self.occ_y_min_input.value)
+        if y_max is None:
+            y_max = float(self.occ_y_max_input.value)
+        if min_points_per_cell is None:
+            min_points_per_cell = int(self.occ_min_points_slider.value)
+        if fill_unexplored_as_occupied is None:
+            fill_unexplored_as_occupied = bool(self.occ_fill_void_checkbox.value)
+
+        if y_min >= y_max:
+            raise ValueError(f"Y Min ({y_min:.2f}) must be strictly less than Y Max ({y_max:.2f}).")
+
+        pts = self._get_all_scene_points(downsample_factor=downsample_factor)
+        if len(pts) == 0:
+            raise RuntimeError("No valid points available in scene to generate occupancy grid.")
+
+        bounds = self._occ_bounds if hasattr(self, "_occ_bounds") else None
+
+        camera_positions = None
+        if hasattr(self, "cam_dict") and self.cam_dict is not None and "t" in self.cam_dict:
+            try:
+                camera_positions = np.asarray(self.cam_dict["t"], dtype=np.float32)
+            except Exception:
+                pass
+
+        png_path, yaml_path, meta, grid_img = export_occupancy_grid(
+            output_path=output_path,
+            points=pts,
+            resolution=resolution,
+            y_min=y_min,
+            y_max=y_max,
+            min_points_per_cell=min_points_per_cell,
+            fill_unexplored_as_occupied=fill_unexplored_as_occupied,
+            camera_positions=camera_positions,
+            bounds=bounds,
+        )
+        return png_path, yaml_path, meta, grid_img
+
+    def _export_occupancy_grid(self):
+        """GUI callback for exporting occupancy grid."""
+        out_path = self.occ_output_path.value
+        self.occ_status.value = "Generating occupancy grid..."
+        try:
+            png_path, yaml_path, meta, grid_img = self.export_occupancy_grid(
+                output_path=out_path
+            )
+            parent_name = os.path.basename(os.path.dirname(png_path))
+            self.occ_status.value = f"Saved in {parent_name}/ ({meta['cols']}x{meta['rows']})"
+            print(f"[OccupancyGrid] Exported to:\n  PNG:  {png_path}\n  YAML: {yaml_path}")
+
+            # Update preview thumbnail in GUI (downscaled if large for smooth display)
+            h, w = grid_img.shape
+            max_preview = 320
+            scale = min(1.0, max_preview / max(h, w))
+            if scale < 1.0:
+                preview_small = cv2.resize(grid_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_NEAREST)
+            else:
+                preview_small = grid_img
+            preview_rgb = cv2.cvtColor(preview_small, cv2.COLOR_GRAY2RGB)
+            self.occ_preview_image.image = preview_rgb
+
+        except Exception as e:
+            self.occ_status.value = f"Error: {e}"
+            print(f"[OccupancyGrid] Export failed: {e}")
 
     @staticmethod
     def _build_trajectory_tube(positions, radius, colormap, num_cameras):

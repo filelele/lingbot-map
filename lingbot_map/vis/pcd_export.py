@@ -133,7 +133,7 @@ def export_predictions_to_pcd(
     use_point_map: bool = False,
     binary: bool = True,
 ) -> Optional[str]:
-    """Export predictions dictionary to a standalone .pcd file (point cloud only, no cameras).
+    """Export predictions dictionary to a .pcd file.
 
     Args:
         pred_dict: Model prediction dictionary containing images, extrinsic, intrinsic, depth/world_points.

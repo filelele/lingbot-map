@@ -176,6 +176,10 @@ def generate_occupancy_grid(
     min_points_per_cell: int = 3,
     fill_unexplored_as_occupied: bool = True,
     camera_positions: Optional[np.ndarray] = None,
+    wall_kernel_shape: str = "Rectangle",
+    wall_kernel_size: int = 3,
+    fill_method: str = "raycasting",
+    frame_rays: Optional[Any] = None,
     bounds: Optional[Dict[str, float]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Generate a 2D occupancy grid from 3D points.
@@ -192,8 +196,12 @@ def generate_occupancy_grid(
         y_min: Upper height cutoff (smaller/negative Y).
         y_max: Lower height cutoff (larger/positive Y, just above floor).
         min_points_per_cell: Minimum points in a cell to count as occupied.
-        fill_unexplored_as_occupied: Fill exterior void as occupied using inside-out flood fill.
+        fill_unexplored_as_occupied: Fill exterior void as occupied.
         camera_positions: Optional (M, 3) camera/rover trajectory positions.
+        wall_kernel_shape: Kernel shape for wall closing ("Rectangle", "Ellipse", "Cross").
+        wall_kernel_size: Kernel dimension (odd integer >= 1, e.g. 1, 3, 5, 7).
+        fill_method: "raycasting" (Method A: Line-of-Sight) or "floodfill" (Method B: Inside-Out Flood Fill).
+        frame_rays: Optional per-frame (cam_pos, points) iterable for exact raycasting.
         bounds: Optional explicit scene bounds dict.
 
     Returns:
@@ -230,16 +238,91 @@ def generate_occupancy_grid(
     img_counts = np.flipud(grid_z_x)
     is_obstacle = (img_counts >= min_points_per_cell)
 
-    if not fill_unexplored_as_occupied:
+    k_size = max(1, int(wall_kernel_size))
+    if k_size % 2 == 0:
+        k_size += 1
+
+    shape_map = {
+        "rectangle": cv2.MORPH_RECT,
+        "ellipse": cv2.MORPH_ELLIPSE,
+        "cross": cv2.MORPH_CROSS,
+    }
+    cv2_shape = shape_map.get(str(wall_kernel_shape).lower().strip(), cv2.MORPH_RECT)
+
+    if not fill_unexplored_as_occupied and not str(fill_method).lower().startswith("raycast"):
         # Standard 2-state: all non-obstacle cells are Free
         grid_img = np.full((rows, cols), 255, dtype=np.uint8)
         grid_img[is_obstacle] = 0
+    elif str(fill_method).lower().startswith("raycast"):
+        # Method A: Line-of-sight raycasting from camera positions to observed points.
+        # Rays terminate strictly at observed points, so they NEVER leak through open doorways or unmapped walls into void.
+        free_mask = np.zeros((rows, cols), dtype=np.uint8)
+
+        if frame_rays is not None:
+            # High-accuracy per-frame optical raycasting
+            for cam_pos, f_pts in frame_rays:
+                if cam_pos is None or len(f_pts) == 0:
+                    continue
+                c_cam = int(np.clip(np.floor((cam_pos[0] - x_min) / resolution), 0, cols - 1))
+                r_cam = int(np.clip(rows - 1 - np.floor((cam_pos[2] - z_min) / resolution), 0, rows - 1))
+
+                # Cast rays to points in and below obstacle slice
+                valid_mask = (f_pts[:, 1] >= y_min)
+                f_sub = f_pts[valid_mask]
+                if len(f_sub) == 0:
+                    continue
+
+                tgt_c = np.clip(np.floor((f_sub[:, 0] - x_min) / resolution).astype(int), 0, cols - 1)
+                tgt_r = np.clip(rows - 1 - np.floor((f_sub[:, 2] - z_min) / resolution).astype(int), 0, rows - 1)
+
+                for c, r in zip(tgt_c, tgt_r):
+                    cv2.line(free_mask, (c_cam, r_cam), (int(c), int(r)), 255, 1)
+
+        elif camera_positions is not None and len(camera_positions) > 0:
+            # Fallback: Raycast from nearest camera trajectory poses
+            cams = np.asarray(camera_positions, dtype=np.float32)
+            cams_2d = cams[:, [0, 2]] if cams.shape[1] >= 3 else cams[:, :2]
+
+            valid_mask = (pts[:, 1] >= y_min)
+            sub_pts = pts[valid_mask]
+            pts_2d = sub_pts[:, [0, 2]]
+
+            chunk_size = 50000
+            for start_idx in range(0, len(pts_2d), chunk_size):
+                chunk_pts = pts_2d[start_idx:start_idx + chunk_size]
+                diff = chunk_pts[:, None, :] - cams_2d[None, :, :]
+                dist_sq = np.sum(diff**2, axis=-1)
+                nearest_cam_idx = np.argmin(dist_sq, axis=-1)
+
+                sub_c = np.clip(np.floor((chunk_pts[:, 0] - x_min) / resolution).astype(int), 0, cols - 1)
+                sub_r = np.clip(rows - 1 - np.floor((chunk_pts[:, 1] - z_min) / resolution).astype(int), 0, rows - 1)
+
+                for p_idx in range(len(chunk_pts)):
+                    c_idx = nearest_cam_idx[p_idx]
+                    cam_x, cam_z = cams_2d[c_idx]
+                    c_cam = int(np.clip(np.floor((cam_x - x_min) / resolution), 0, cols - 1))
+                    r_cam = int(np.clip(rows - 1 - np.floor((cam_z - z_min) / resolution), 0, rows - 1))
+                    cv2.line(free_mask, (c_cam, r_cam), (int(sub_c[p_idx]), int(sub_r[p_idx])), 255, 1)
+
+        # Close micro-pinholes between discrete rays on the floor
+        if k_size > 1:
+            kernel_ray = cv2.getStructuringElement(cv2_shape, (k_size, k_size))
+            free_mask = cv2.morphologyEx(free_mask, cv2.MORPH_CLOSE, kernel_ray)
+
+        grid_img = np.zeros((rows, cols), dtype=np.uint8)
+        grid_img[free_mask > 0] = 255
+        grid_img[is_obstacle] = 0
     else:
         # Inside-out flood fill (Method 2):
-        # 1. Close small cracks in walls (3x3 kernel) so sparse points form solid watertight walls
+        # 1. Close small cracks in walls so sparse points form solid watertight walls
         obs_u8 = is_obstacle.astype(np.uint8) * 255
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed_obs = cv2.morphologyEx(obs_u8, cv2.MORPH_CLOSE, kernel_close)
+
+        if k_size > 1:
+            kernel_close = cv2.getStructuringElement(cv2_shape, (k_size, k_size))
+            closed_obs = cv2.morphologyEx(obs_u8, cv2.MORPH_CLOSE, kernel_close)
+        else:
+            closed_obs = obs_u8
+
         passable = (closed_obs == 0).astype(np.uint8) * 255
 
         # 2. Gather interior seed points (guaranteed inside the room)
@@ -301,6 +384,9 @@ def generate_occupancy_grid(
         "origin": [float(x_min), float(z_min), 0.0],
         "min_points_per_cell": int(min_points_per_cell),
         "fill_unexplored_as_occupied": bool(fill_unexplored_as_occupied),
+        "fill_method": str(fill_method),
+        "wall_kernel_shape": str(wall_kernel_shape),
+        "wall_kernel_size": int(k_size),
         "num_obstacle_points": int(len(obs_pts)),
         "num_total_points": int(len(pts)),
     }
@@ -317,6 +403,10 @@ def export_occupancy_grid(
     min_points_per_cell: int = 3,
     fill_unexplored_as_occupied: bool = True,
     camera_positions: Optional[np.ndarray] = None,
+    wall_kernel_shape: str = "Rectangle",
+    wall_kernel_size: int = 3,
+    fill_method: str = "raycasting",
+    frame_rays: Optional[Any] = None,
     bounds: Optional[Dict[str, float]] = None,
 ) -> Tuple[str, str, Dict[str, Any], np.ndarray]:
     """Export 2D occupancy grid as ROS-standard .png and companion .yaml metadata.
@@ -330,6 +420,10 @@ def export_occupancy_grid(
         min_points_per_cell: Minimum points to mark cell as occupied.
         fill_unexplored_as_occupied: Fill exterior void as occupied using inside-out flood fill.
         camera_positions: Optional (M, 3) camera/rover trajectory positions.
+        wall_kernel_shape: Kernel shape for wall closing ("Rectangle", "Ellipse", "Cross").
+        wall_kernel_size: Kernel dimension (odd integer >= 1).
+        fill_method: "raycasting" (Line of sight) or "floodfill".
+        frame_rays: Optional per-frame (cam_pos, points) iterable for exact raycasting.
         bounds: Optional precalculated scene bounds.
 
     Returns:
@@ -364,6 +458,10 @@ def export_occupancy_grid(
         min_points_per_cell=min_points_per_cell,
         fill_unexplored_as_occupied=fill_unexplored_as_occupied,
         camera_positions=camera_positions,
+        wall_kernel_shape=wall_kernel_shape,
+        wall_kernel_size=wall_kernel_size,
+        fill_method=fill_method,
+        frame_rays=frame_rays,
         bounds=bounds,
     )
 
@@ -384,6 +482,9 @@ def export_occupancy_grid(
         "y_range": [meta["y_min"], meta["y_max"]],
         "min_points_per_cell": meta["min_points_per_cell"],
         "fill_unexplored_as_occupied": meta["fill_unexplored_as_occupied"],
+        "fill_method": meta["fill_method"],
+        "wall_kernel_shape": meta["wall_kernel_shape"],
+        "wall_kernel_size": meta["wall_kernel_size"],
     }
 
     with open(yaml_path, "w") as f:

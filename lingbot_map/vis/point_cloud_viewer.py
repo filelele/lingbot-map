@@ -581,7 +581,24 @@ class PointCloudViewer:
             )
             self.occ_fill_void_checkbox = self.server.gui.add_checkbox(
                 "Fill Void as Occupied", initial_value=True,
-                hint="Fill unmapped void outside walls as occupied using flood fill."
+                hint="Fill unmapped void outside walls as occupied."
+            )
+            self.occ_fill_method = self.server.gui.add_dropdown(
+                "Fill Method",
+                options=["Raycasting (Line of Sight)", "Inside-Out Flood Fill"],
+                initial_value="Raycasting (Line of Sight)",
+                hint="Raycasting never leaks through open doors/holes. Flood fill fills solid room interior.",
+            )
+            self.occ_wall_kernel_shape = self.server.gui.add_dropdown(
+                "Wall Seal Shape",
+                options=["Rectangle", "Ellipse", "Cross"],
+                initial_value="Rectangle",
+                hint="Morphological kernel shape for bridging wall gaps.",
+            )
+            self.occ_wall_kernel_size = self.server.gui.add_slider(
+                "Wall Seal Size",
+                min=1, max=15, step=2, initial_value=3,
+                hint="Kernel size (odd integer). 1 = none, 3-5 = bridges 1-4 cell gaps.",
             )
             self.occ_btn_refresh = self.server.gui.add_button(
                 "Refresh Histogram & Bounds",
@@ -1012,6 +1029,43 @@ class PointCloudViewer:
             return np.empty((0, 3), dtype=np.float32)
         return np.concatenate(all_points, axis=0)
 
+    def _get_cam_pos(self, step):
+        """Retrieve 3D camera translation for a given step/frame."""
+        if self.cam_dict is not None and "t" in self.cam_dict:
+            try:
+                return np.asarray(self.cam_dict["t"][step], dtype=np.float32)
+            except (KeyError, IndexError, TypeError):
+                try:
+                    idx = self.all_steps.index(step)
+                    return np.asarray(self.cam_dict["t"][idx], dtype=np.float32)
+                except Exception:
+                    return None
+        return None
+
+    def _get_frame_rays(self, downsample_factor: int = 2):
+        """Collect per-frame (camera_pos, frame_points) for exact line-of-sight raycasting."""
+        frame_rays = []
+        orig_vis = self.vis_threshold
+        try:
+            self.vis_threshold = getattr(self, "vis_threshold", 1.0)
+            for step in self.all_steps:
+                cam_pos = self._get_cam_pos(step)
+                if cam_pos is None:
+                    continue
+                pc = self.pcs[step]["pc"]
+                color = self.pcs[step]["color"]
+                conf = self.pcs[step]["conf"]
+                edge_color = self.pcs[step].get("edge_color", None)
+                pts, _ = self.parse_pc_data(
+                    pc, color, conf, edge_color, set_border_color=False,
+                    downsample_factor=downsample_factor,
+                )
+                if len(pts) > 0:
+                    frame_rays.append((cam_pos, pts))
+        finally:
+            self.vis_threshold = orig_vis
+        return frame_rays
+
     def _init_occupancy_grid_state(self):
         """Initialize bounds, histogram, and default controls for occupancy grid."""
         try:
@@ -1119,6 +1173,9 @@ class PointCloudViewer:
         y_max: Optional[float] = None,
         min_points_per_cell: Optional[int] = None,
         fill_unexplored_as_occupied: Optional[bool] = None,
+        fill_method: Optional[str] = None,
+        wall_kernel_shape: Optional[str] = None,
+        wall_kernel_size: Optional[int] = None,
         downsample_factor: int = 1,
     ) -> Tuple[str, str, Dict[str, Any], np.ndarray]:
         """Generate and export a 2D occupancy grid map (.png and .yaml)."""
@@ -1132,8 +1189,14 @@ class PointCloudViewer:
             y_max = float(self.occ_y_max_input.value)
         if min_points_per_cell is None:
             min_points_per_cell = int(self.occ_min_points_slider.value)
+        if fill_method is None:
+            fill_method = self.occ_fill_method.value if hasattr(self, "occ_fill_method") else "Raycasting (Line of Sight)"
         if fill_unexplored_as_occupied is None:
             fill_unexplored_as_occupied = bool(self.occ_fill_void_checkbox.value)
+        if wall_kernel_shape is None:
+            wall_kernel_shape = self.occ_wall_kernel_shape.value if hasattr(self, "occ_wall_kernel_shape") else "Rectangle"
+        if wall_kernel_size is None:
+            wall_kernel_size = int(self.occ_wall_kernel_size.value) if hasattr(self, "occ_wall_kernel_size") else 3
 
         if y_min >= y_max:
             raise ValueError(f"Y Min ({y_min:.2f}) must be strictly less than Y Max ({y_max:.2f}).")
@@ -1151,6 +1214,14 @@ class PointCloudViewer:
             except Exception:
                 pass
 
+        frame_rays = None
+        if str(fill_method).lower().startswith("raycast"):
+            # Gather per-frame optical ray data for exact line-of-sight raycasting
+            try:
+                frame_rays = self._get_frame_rays(downsample_factor=2)
+            except Exception as e:
+                print(f"[OccupancyGrid] Warning: could not extract per-frame rays: {e}, using trajectory fallback.")
+
         png_path, yaml_path, meta, grid_img = export_occupancy_grid(
             output_path=output_path,
             points=pts,
@@ -1160,7 +1231,11 @@ class PointCloudViewer:
             min_points_per_cell=min_points_per_cell,
             fill_unexplored_as_occupied=fill_unexplored_as_occupied,
             camera_positions=camera_positions,
+            wall_kernel_shape=wall_kernel_shape,
+            wall_kernel_size=wall_kernel_size,
             bounds=bounds,
+            fill_method=fill_method,
+            frame_rays=frame_rays,
         )
         return png_path, yaml_path, meta, grid_img
 

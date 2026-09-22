@@ -59,38 +59,54 @@ def _build_streaming_frame_metadata(
     return frame_type, frame_type != 2
 
 
+_LAST_KV_SNAPSHOT = {"frame_count": 0, "cache_mb": 0.0}
+
+
 @torch.no_grad()
 def _log_kv_stats(model, label: str = "") -> None:
-    """One-line dump of aggregator KV cache occupancy + aux counters."""
+    """Detailed dump of aggregator KV cache occupancy, active vs evicted keyframes, and VRAM growth."""
+    global _LAST_KV_SNAPSHOT
     try:
         parts = []
         agg = getattr(model, "aggregator", None)
         if agg is not None:
-            tfp = getattr(agg, "total_frames_processed", None)
-            if tfp is not None:
-                parts.append(f"tfp={tfp}")
             mgr = getattr(agg, "kv_cache_manager", None)
             if mgr is not None and hasattr(mgr, "get_cache_stats"):
                 s = mgr.get_cache_stats(block_idx=0)
+                frame_count = s['frame_count']
+                active_kfs = s['scale_pages'] + s['live_pages']
+                evicted_kfs = max(0, frame_count - active_kfs)
+
+                bytes_per_token = 2 * mgr.num_heads * mgr.head_dim * 2 * mgr.num_blocks
+                active_mb = (active_kfs * mgr.page_size * bytes_per_token) / (1024 * 1024)
+                special_mb = (s['special_tokens'] * bytes_per_token) / (1024 * 1024)
+                total_kv_mb = active_mb + special_mb
+
+                d_frames = frame_count - _LAST_KV_SNAPSHOT["frame_count"]
+                d_mb = total_kv_mb - _LAST_KV_SNAPSHOT["cache_mb"]
+                rate_str = f"+{d_mb / d_frames:.2f} MB/KF" if d_frames > 0 else "0.00 MB/KF"
+                _LAST_KV_SNAPSHOT = {"frame_count": frame_count, "cache_mb": total_kv_mb}
+
                 parts.append(
-                    f"FI[blk0] frames={s['frame_count']} "
-                    f"scale_pg={s['scale_pages']} live_pg={s['live_pages']} "
-                    f"free_pg={s['free_pages']} special={s['special_tokens']}"
+                    f"Active KFs: {active_kfs} ({active_mb:.1f} MB) | "
+                    f"Evicted KFs: {evicted_kfs} ({special_mb:.2f} MB) | "
+                    f"KV Payload: {total_kv_mb:.1f} MB ({rate_str})"
                 )
             elif isinstance(getattr(agg, "kv_cache", None), dict):
                 kv = agg.kv_cache
                 k0 = kv.get("k_0")
                 if torch.is_tensor(k0):
-                    parts.append(f"SDPA[blk0] k_shape={tuple(k0.shape)}")
+                    parts.append(f"SDPA[blk0] shape={tuple(k0.shape)}")
                 parts.append(f"skip_append={kv.get('_skip_append', False)}")
-        cam = getattr(model, "camera_head", None)
-        if cam is not None:
-            fi = getattr(cam, "frame_idx", None)
-            if fi is not None:
-                parts.append(f"cam.frame_idx={fi}")
-        tqdm.write(f"[KV] {label} | {' | '.join(parts)}")
+
+        if torch.cuda.is_available():
+            vram_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            vram_res = torch.cuda.memory_reserved() / (1024 ** 3)
+            parts.append(f"VRAM: {vram_alloc:.2f}G alloc, {vram_res:.2f}G res")
+
+        tqdm.write(f"[KV Tracker] {label} | {' | '.join(parts)}")
     except Exception as e:  # pragma: no cover — debug helper, never fatal
-        tqdm.write(f"[KV] {label} | stats error: {e}")
+        tqdm.write(f"[KV Tracker] {label} | stats error: {e}")
 
 
 class GCTStream(GCTBase):
@@ -348,11 +364,30 @@ class GCTStream(GCTBase):
                 - num_cached_blocks: Number of blocks with cached KV
                 - cache_memory_mb: Approximate memory usage in MB
         """
+        # 1. Check FlashInfer backend
+        if hasattr(self.aggregator, 'kv_cache_manager') and self.aggregator.kv_cache_manager is not None:
+            mgr = self.aggregator.kv_cache_manager
+            frame_cnt = mgr.frame_count[0] if mgr.frame_count else 0
+            if frame_cnt == 0:
+                return {"num_cached_blocks": 0, "cache_memory_mb": 0.0, "backend": "flashinfer"}
+
+            active_pages = len(mgr.scale_patch_pages[0]) + len(mgr.live_window_patch_pages[0])
+            active_tokens = active_pages * mgr.page_size + mgr.special_token_count[0]
+            # Key + Value (2) * heads * head_dim * 2 bytes (fp16/bf16) * num_blocks
+            bytes_per_token = 2 * mgr.num_heads * mgr.head_dim * 2 * mgr.num_blocks
+            cache_memory_mb = (active_tokens * bytes_per_token) / (1024 * 1024)
+            return {
+                "num_cached_blocks": frame_cnt,
+                "cache_memory_mb": round(cache_memory_mb, 2),
+                "backend": "flashinfer",
+            }
+
+        # 2. Check SDPA backend
         if not hasattr(self.aggregator, 'kv_cache') or self.aggregator.kv_cache is None:
             return {"num_cached_blocks": 0, "cache_memory_mb": 0.0}
 
         kv_cache = self.aggregator.kv_cache
-        num_cached = sum(1 for k in kv_cache.keys() if k.startswith('k_') and not k.endswith('_special'))
+        num_cached = sum(1 for k, v in kv_cache.items() if k.startswith('k_') and not k.endswith('_special') and v is not None)
 
         # Estimate memory usage
         total_elements = 0
@@ -365,7 +400,8 @@ class GCTStream(GCTBase):
 
         return {
             "num_cached_blocks": num_cached,
-            "cache_memory_mb": round(cache_memory_mb, 2)
+            "cache_memory_mb": round(cache_memory_mb, 2),
+            "backend": "sdpa",
         }
 
     @torch.no_grad()

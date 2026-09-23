@@ -45,7 +45,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
-from lingbot_map.utils.geometry import closed_form_inverse_se3_general
+from lingbot_map.utils.geometry import closed_form_inverse_se3, closed_form_inverse_se3_general
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 
@@ -242,8 +242,6 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
                 model._set_skip_append(False)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    # Wipe warmup KV so real inference_streaming starts clean (it also calls
-    # clean_kv_cache internally, but this is defensive + makes intent obvious).
     model.clean_kv_cache()
 
 
@@ -572,6 +570,19 @@ def main():
 
     output_device = torch.device("cpu") if args.offload_to_cpu else None
 
+    captured_descs = []
+
+    def _desc_hook(module, input, output):
+        with torch.no_grad():
+            tok = output["x_norm_patchtokens"] if isinstance(output, dict) else output
+            d = tok.mean(dim=1)
+            d = torch.nn.functional.normalize(d, p=2, dim=-1)
+            captured_descs.append(d.detach().cpu())
+
+    hook_handle = None
+    if hasattr(model, "aggregator") and hasattr(model.aggregator, "patch_embed"):
+        hook_handle = model.aggregator.patch_embed.register_forward_hook(_desc_hook)
+
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
         if args.mode == "streaming":
             predictions = model.inference_streaming(
@@ -591,6 +602,9 @@ def main():
                 output_device=output_device
             )
 
+    if hook_handle is not None:
+        hook_handle.remove()
+
     print(f"Inference done in {time.time() - t0:.1f}s")
     if torch.cuda.is_available():
         print(
@@ -609,6 +623,39 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+
+    # ── Export Map Reference for Localizer/Visual Place Recognition ──────────────────────────────────
+    if captured_descs:
+        try:
+            ref_descs = torch.cat(captured_descs, dim=0).numpy()
+            extri = predictions.get("extrinsic")
+            if extri is not None:
+                if torch.is_tensor(extri):
+                    extri = extri.detach().cpu().numpy()
+
+                min_len = min(len(ref_descs), len(extri))
+                ref_descs = ref_descs[:min_len]
+                extri = extri[:min_len]
+
+                # Convert World-to-Camera (extrinsic) to Camera-to-World (c2w)
+                c2w_4x4 = closed_form_inverse_se3(extri)
+                positions = c2w_4x4[:, :3, 3]
+                yaws = np.arctan2(c2w_4x4[:, 0, 2], c2w_4x4[:, 2, 2]).astype(np.float32)
+
+                occ_dir = os.path.join(resolved_image_folder, "occupancy_grid")
+                os.makedirs(occ_dir, exist_ok=True)
+                ref_path = os.path.join(occ_dir, "map_reference.npz")
+                np.savez_compressed(
+                    ref_path,
+                    descriptors=ref_descs,
+                    c2w=c2w_4x4,
+                    positions=positions,
+                    yaws=yaws,
+                    image_paths=np.array(paths[:min_len]),
+                )
+                print(f"[Map Reference] Saved {min_len} reference descriptors & poses to {ref_path}")
+        except Exception as e:
+            print(f"[Map Reference] Warning: could not export map_reference.npz: {e}")
 
 
     # ── PCD Export & Visualization ───────────────────────────────────────────
